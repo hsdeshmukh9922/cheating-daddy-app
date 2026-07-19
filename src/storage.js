@@ -8,12 +8,12 @@ const CONFIG_VERSION = 1;
 const DEFAULT_CONFIG = {
     configVersion: CONFIG_VERSION,
     onboarded: false,
-    layout: 'normal'
+    layout: 'normal',
 };
 
 const DEFAULT_CREDENTIALS = {
     apiKey: '',
-    groqApiKey: ''
+    groqApiKey: '',
 };
 
 const DEFAULT_PREFERENCES = {
@@ -30,13 +30,22 @@ const DEFAULT_PREFERENCES = {
     googleSearchEnabled: false,
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: 'llama3.1',
+    localBackend: 'ollama', // 'ollama' | 'lmstudio'
+    localAnswerMode: 'local', // 'local' = answers from local model | 'cloud' = answers from Groq/Claude (transcription stays local)
+    lmstudioHost: 'http://127.0.0.1:1234',
+    lmstudioModel: '',
     whisperModel: 'Xenova/whisper-small',
+    groqModel: 'llama-3.3-70b-versatile',
+    smartClickThrough: false,
+    autoCopyClipboard: false,
+    vadMode: 'VERY_AGGRESSIVE',
+    useGroqTranscription: true,
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults
 
 const DEFAULT_LIMITS = {
-    data: [] // Array of { date: 'YYYY-MM-DD', flash: { count }, flashLite: { count }, groq: { 'qwen3-32b': { chars, limit }, 'gpt-oss-120b': { chars, limit }, 'gpt-oss-20b': { chars, limit } }, gemini: { 'gemma-4-26b-a4b-it': { chars } } }
+    data: [], // Array of { date: 'YYYY-MM-DD', flash: { count }, flashLite: { count }, groq: { 'qwen3-32b': { chars, limit }, 'gpt-oss-120b': { chars, limit }, 'gpt-oss-20b': { chars, limit } }, gemini: { 'gemma-4-26b-a4b-it': { chars } } }
 };
 
 // Get the config directory path based on OS
@@ -178,19 +187,96 @@ function updateConfig(key, value) {
 }
 
 // ============ CREDENTIALS ============
+// API keys are encrypted at rest with Electron safeStorage (OS keychain-backed).
+// Values are stored as 'enc:v1:<base64>'; plaintext values from older versions
+// are still readable and get encrypted on the next write (see migration below).
+
+const ENC_PREFIX = 'enc:v1:';
+
+function getSafeStorage() {
+    try {
+        const { safeStorage } = require('electron');
+        if (safeStorage && safeStorage.isEncryptionAvailable()) return safeStorage;
+    } catch (e) {
+        // Not running under Electron (unit tests) - fall through to plaintext
+    }
+    return null;
+}
+
+function encryptValue(value) {
+    if (typeof value !== 'string' || value === '' || value.startsWith(ENC_PREFIX)) return value;
+    const ss = getSafeStorage();
+    if (!ss) return value;
+    try {
+        return ENC_PREFIX + ss.encryptString(value).toString('base64');
+    } catch (e) {
+        console.error('Failed to encrypt credential:', e.message);
+        return value;
+    }
+}
+
+function decryptValue(value) {
+    if (typeof value !== 'string' || !value.startsWith(ENC_PREFIX)) return value;
+    const ss = getSafeStorage();
+    if (!ss) return '';
+    try {
+        return ss.decryptString(Buffer.from(value.slice(ENC_PREFIX.length), 'base64'));
+    } catch (e) {
+        console.error('Failed to decrypt credential:', e.message);
+        return '';
+    }
+}
 
 function getCredentials() {
-    return readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    const raw = readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    const decrypted = {};
+    for (const [key, value] of Object.entries(raw)) {
+        decrypted[key] = decryptValue(value);
+    }
+
+    // Support environment variable fallbacks
+    if (process.env.GEMINI_API_KEY) {
+        decrypted.apiKey = process.env.GEMINI_API_KEY;
+    }
+    if (process.env.GROQ_API_KEY) {
+        decrypted.groqApiKey = process.env.GROQ_API_KEY;
+    }
+    if (process.env.ANTHROPIC_API_KEY) {
+        decrypted.anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+    } else if (process.env.CLAUDE_API_KEY) {
+        decrypted.anthropicApiKey = process.env.CLAUDE_API_KEY;
+    }
+
+    return decrypted;
 }
 
 function setCredentials(credentials) {
-    const current = getCredentials();
-    const updated = { ...current, ...credentials };
+    // Merge against the raw (still-encrypted) file so untouched keys are never
+    // decrypted and re-written
+    const currentRaw = readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    const updated = { ...currentRaw };
+    for (const [key, value] of Object.entries(credentials)) {
+        updated[key] = encryptValue(value);
+    }
     return writeJsonFile(getCredentialsPath(), updated);
 }
 
+// One-time migration: encrypt any plaintext credentials left by older versions
+function migrateCredentialsEncryption() {
+    if (!getSafeStorage()) return;
+    const raw = readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS);
+    const needsMigration = Object.values(raw).some(v => typeof v === 'string' && v !== '' && !v.startsWith(ENC_PREFIX));
+    if (!needsMigration) return;
+    const encrypted = {};
+    for (const [key, value] of Object.entries(raw)) {
+        encrypted[key] = encryptValue(value);
+    }
+    writeJsonFile(getCredentialsPath(), encrypted);
+    console.log('Migrated stored credentials to encrypted format');
+}
+
 function getApiKey() {
-    return getCredentials().apiKey || '';
+    return process.env.GEMINI_API_KEY || getCredentials().apiKey || '';
 }
 
 function setApiKey(apiKey) {
@@ -198,7 +284,7 @@ function setApiKey(apiKey) {
 }
 
 function getGroqApiKey() {
-    return getCredentials().groqApiKey || '';
+    return process.env.GROQ_API_KEY || getCredentials().groqApiKey || '';
 }
 
 function setGroqApiKey(groqApiKey) {
@@ -258,17 +344,17 @@ function getTodayLimits() {
 
     if (todayEntry) {
         // ensure new fields exist
-        if(!todayEntry.groq) {
+        if (!todayEntry.groq) {
             todayEntry.groq = {
                 'qwen3-32b': { chars: 0, limit: 1500000 },
                 'gpt-oss-120b': { chars: 0, limit: 600000 },
                 'gpt-oss-20b': { chars: 0, limit: 600000 },
-                'kimi-k2-instruct': { chars: 0, limit: 600000 }
+                'kimi-k2-instruct': { chars: 0, limit: 600000 },
             };
         }
-        if(!todayEntry.gemini) {
+        if (!todayEntry.gemini) {
             todayEntry.gemini = {
-                'gemma-4-26b-a4b-it': { chars: 0 }
+                'gemma-4-26b-a4b-it': { chars: 0 },
             };
         }
         setLimits(limits);
@@ -285,11 +371,11 @@ function getTodayLimits() {
             'qwen3-32b': { chars: 0, limit: 1500000 },
             'gpt-oss-120b': { chars: 0, limit: 600000 },
             'gpt-oss-20b': { chars: 0, limit: 600000 },
-            'kimi-k2-instruct': { chars: 0, limit: 600000 }
+            'kimi-k2-instruct': { chars: 0, limit: 600000 },
         },
         gemini: {
-            'gemma-4-26b-a4b-it': { chars: 0 }
-        }
+            'gemma-4-26b-a4b-it': { chars: 0 },
+        },
     };
     limits.data.push(newEntry);
     setLimits(limits);
@@ -310,7 +396,7 @@ function incrementLimitCount(model) {
         todayEntry = {
             date: today,
             flash: { count: 0 },
-            flashLite: { count: 0 }
+            flashLite: { count: 0 },
         };
         limits.data.push(todayEntry);
     } else {
@@ -319,9 +405,9 @@ function incrementLimitCount(model) {
     }
 
     // Increment the appropriate model count
-    if (model === 'gemini-2.5-flash') {
+    if (model === 'gemini-3.1-flash') {
         todayEntry.flash.count++;
-    } else if (model === 'gemini-2.5-flash-lite') {
+    } else if (model === 'gemini-3.1-flash-lite') {
         todayEntry.flashLite.count++;
     }
 
@@ -336,7 +422,7 @@ function incrementCharUsage(provider, model, charCount) {
     const today = getTodayDateString();
     const todayEntry = limits.data.find(entry => entry.date === today);
 
-    if(todayEntry[provider] && todayEntry[provider][model]) {
+    if (todayEntry[provider] && todayEntry[provider][model]) {
         todayEntry[provider][model].chars += charCount;
         setLimits(limits);
     }
@@ -350,12 +436,12 @@ function getAvailableModel() {
     // RPD limits: flash = 20, flash-lite = 20
     // After both exhausted, fall back to flash (for paid API users)
     if (todayLimits.flash.count < 20) {
-        return 'gemini-2.5-flash';
+        return 'gemini-3.1-flash';
     } else if (todayLimits.flashLite.count < 20) {
-        return 'gemini-2.5-flash-lite';
+        return 'gemini-3.1-flash-lite';
     }
 
-    return 'gemini-2.5-flash'; // Default to flash for paid API users
+    return 'gemini-3.1-flash'; // Default to flash for paid API users
 }
 
 function getModelForToday() {
@@ -400,7 +486,7 @@ function saveSession(sessionId, data) {
         customPrompt: data.customPrompt || existingSession?.customPrompt || null,
         // Conversation data
         conversationHistory: data.conversationHistory || existingSession?.conversationHistory || [],
-        screenAnalysisHistory: data.screenAnalysisHistory || existingSession?.screenAnalysisHistory || []
+        screenAnalysisHistory: data.screenAnalysisHistory || existingSession?.screenAnalysisHistory || [],
     };
     return writeJsonFile(sessionPath, sessionData);
 }
@@ -417,7 +503,8 @@ function getAllSessions() {
             return [];
         }
 
-        const files = fs.readdirSync(historyDir)
+        const files = fs
+            .readdirSync(historyDir)
             .filter(f => f.endsWith('.json'))
             .sort((a, b) => {
                 // Sort by timestamp descending (newest first)
@@ -426,22 +513,24 @@ function getAllSessions() {
                 return tsB - tsA;
             });
 
-        return files.map(file => {
-            const sessionId = file.replace('.json', '');
-            const data = readJsonFile(path.join(historyDir, file), null);
-            if (data) {
-                return {
-                    sessionId,
-                    createdAt: data.createdAt,
-                    lastUpdated: data.lastUpdated,
-                    messageCount: data.conversationHistory?.length || 0,
-                    screenAnalysisCount: data.screenAnalysisHistory?.length || 0,
-                    profile: data.profile || null,
-                    customPrompt: data.customPrompt || null
-                };
-            }
-            return null;
-        }).filter(Boolean);
+        return files
+            .map(file => {
+                const sessionId = file.replace('.json', '');
+                const data = readJsonFile(path.join(historyDir, file), null);
+                if (data) {
+                    return {
+                        sessionId,
+                        createdAt: data.createdAt,
+                        lastUpdated: data.lastUpdated,
+                        messageCount: data.conversationHistory?.length || 0,
+                        screenAnalysisCount: data.screenAnalysisHistory?.length || 0,
+                        profile: data.profile || null,
+                        customPrompt: data.customPrompt || null,
+                    };
+                }
+                return null;
+            })
+            .filter(Boolean);
     } catch (error) {
         console.error('Error reading sessions:', error.message);
         return [];
@@ -501,6 +590,7 @@ module.exports = {
     setApiKey,
     getGroqApiKey,
     setGroqApiKey,
+    migrateCredentialsEncryption,
 
     // Preferences
     getPreferences,
@@ -528,5 +618,5 @@ module.exports = {
     deleteAllSessions,
 
     // Clear all
-    clearAllData
+    clearAllData,
 };

@@ -4,6 +4,27 @@ const storage = require('../storage');
 
 let mouseEventsIgnored = false;
 
+// Smart click-through: when enabled, the window lets clicks pass to apps underneath.
+// The renderer watches mouse position and re-enables interaction while the cursor
+// is over a real control (buttons, inputs), via the 'set-ignore-mouse-events' IPC.
+function setClickThroughMode(mainWindow, enabled) {
+    if (mainWindow.isDestroyed()) return;
+    mouseEventsIgnored = enabled;
+    if (enabled) {
+        const prefs = storage.getPreferences();
+        const smart = prefs.smartClickThrough ?? false;
+        if (smart) {
+            mainWindow.setIgnoreMouseEvents(true, { forward: true });
+        } else {
+            mainWindow.setIgnoreMouseEvents(true);
+        }
+    } else {
+        mainWindow.setIgnoreMouseEvents(false);
+    }
+    mainWindow.webContents.send('click-through-toggled', enabled);
+    console.log('Click-through mode:', enabled ? 'on' : 'off');
+}
+
 const DEFAULT_MAIN_WINDOW_SIZE = { width: 1100, height: 800 };
 const MIN_WINDOW_SIZE = { width: 700, height: 320 };
 
@@ -173,15 +194,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     if (keybinds.toggleClickThrough) {
         try {
             globalShortcut.register(keybinds.toggleClickThrough, () => {
-                mouseEventsIgnored = !mouseEventsIgnored;
-                if (mouseEventsIgnored) {
-                    mainWindow.setIgnoreMouseEvents(true, { forward: true });
-                    console.log('Mouse events ignored');
-                } else {
-                    mainWindow.setIgnoreMouseEvents(false);
-                    console.log('Mouse events enabled');
-                }
-                mainWindow.webContents.send('click-through-toggled', mouseEventsIgnored);
+                setClickThroughMode(mainWindow, !mouseEventsIgnored);
             });
             console.log(`Registered toggleClickThrough: ${keybinds.toggleClickThrough}`);
         } catch (error) {
@@ -296,9 +309,27 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
 function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
     ipcMain.on('view-changed', (event, view) => {
         if (!mainWindow.isDestroyed()) {
-            if (view !== 'assistant') {
-                mainWindow.setIgnoreMouseEvents(false);
-            }
+            // Always start views interactive. Click-through is opt-in via the
+            // Cmd+M/Ctrl+M shortcut - auto-enabling it left the window unmovable on
+            // macOS, where hover-forwarding while ignoring mouse events is unreliable.
+            setClickThroughMode(mainWindow, false);
+        }
+    });
+
+    // Ghost mode toggle from the live-bar button (same as the Cmd+M/Ctrl+M shortcut)
+    ipcMain.on('toggle-click-through', () => {
+        if (!mainWindow.isDestroyed()) {
+            setClickThroughMode(mainWindow, !mouseEventsIgnored);
+        }
+    });
+
+    // Renderer-driven hover tracking: only honored while click-through mode is active
+    ipcMain.on('set-ignore-mouse-events', (event, ignore) => {
+        if (mainWindow.isDestroyed() || !mouseEventsIgnored) return;
+        if (ignore) {
+            mainWindow.setIgnoreMouseEvents(true, { forward: true });
+        } else {
+            mainWindow.setIgnoreMouseEvents(false);
         }
     });
 
@@ -331,7 +362,6 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
             return { success: false, error: error.message };
         }
     });
-
 }
 
 module.exports = {

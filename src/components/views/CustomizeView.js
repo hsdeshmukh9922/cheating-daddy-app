@@ -185,6 +185,9 @@ export class CustomizeView extends LitElement {
         backgroundTransparency: { type: Number },
         fontSize: { type: Number },
         theme: { type: String },
+        smartClickThrough: { type: Boolean },
+        autoCopyClipboard: { type: Boolean },
+        vadMode: { type: String },
         onProfileChange: { type: Function },
         onLanguageChange: { type: Function },
         onImageQualityChange: { type: Function },
@@ -214,8 +217,10 @@ export class CustomizeView extends LitElement {
         this.backgroundTransparency = 0.8;
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
-        this.customPrompt = '';
         this.theme = 'dark';
+        this.smartClickThrough = false;
+        this.autoCopyClipboard = false;
+        this.vadMode = 'VERY_AGGRESSIVE';
         this._loadFromStorage();
     }
 
@@ -232,6 +237,9 @@ export class CustomizeView extends LitElement {
             this.audioMode = prefs.audioMode ?? 'speaker_only';
             this.customPrompt = prefs.customPrompt ?? '';
             this.theme = prefs.theme ?? 'dark';
+            this.smartClickThrough = prefs.smartClickThrough ?? false;
+            this.autoCopyClipboard = prefs.autoCopyClipboard ?? false;
+            this.vadMode = prefs.vadMode || 'VERY_AGGRESSIVE';
             if (keybinds) {
                 this.keybinds = { ...this.getDefaultKeybinds(), ...keybinds };
             }
@@ -389,6 +397,30 @@ export class CustomizeView extends LitElement {
         this.requestUpdate();
     }
 
+    async handleSmartClickThroughChange(e) {
+        this.smartClickThrough = e.target.checked;
+        await cheatingDaddy.storage.updatePreference('smartClickThrough', this.smartClickThrough);
+        if (cheatingDaddy.refreshPreferencesCache) {
+            await cheatingDaddy.refreshPreferencesCache();
+        }
+        this.requestUpdate();
+    }
+
+    async handleAutoCopyClipboardChange(e) {
+        this.autoCopyClipboard = e.target.checked;
+        await cheatingDaddy.storage.updatePreference('autoCopyClipboard', this.autoCopyClipboard);
+        if (cheatingDaddy.refreshPreferencesCache) {
+            await cheatingDaddy.refreshPreferencesCache();
+        }
+        this.requestUpdate();
+    }
+
+    async handleVadModeChange(e) {
+        this.vadMode = e.target.value;
+        await cheatingDaddy.storage.updatePreference('vadMode', this.vadMode);
+        this.requestUpdate();
+    }
+
     updateBackgroundAppearance() {
         const colors = cheatingDaddy.theme.get(this.theme);
         cheatingDaddy.theme.applyBackgrounds(colors.background, this.backgroundTransparency);
@@ -490,6 +522,9 @@ export class CustomizeView extends LitElement {
                 backgroundTransparency: 0.8,
                 googleSearchEnabled: false,
                 theme: 'dark',
+                smartClickThrough: false,
+                autoCopyClipboard: false,
+                vadMode: 'VERY_AGGRESSIVE',
             };
             for (const [key, value] of Object.entries(defaults)) {
                 await cheatingDaddy.storage.updatePreference(key, value);
@@ -513,6 +548,9 @@ export class CustomizeView extends LitElement {
             this.googleSearchEnabled = defaults.googleSearchEnabled;
             this.customPrompt = defaults.customPrompt;
             this.theme = defaults.theme;
+            this.smartClickThrough = defaults.smartClickThrough;
+            this.autoCopyClipboard = defaults.autoCopyClipboard;
+            this.vadMode = defaults.vadMode;
 
             // Notify parent callbacks
             this.onProfileChange(defaults.selectedProfile);
@@ -523,6 +561,9 @@ export class CustomizeView extends LitElement {
             this.updateBackgroundAppearance();
             this.updateFontSize();
             await cheatingDaddy.theme.save(defaults.theme);
+            if (cheatingDaddy.refreshPreferencesCache) {
+                await cheatingDaddy.refreshPreferencesCache();
+            }
 
             this.clearStatusMessage = 'All settings restored to defaults';
             this.clearStatusType = 'success';
@@ -580,15 +621,28 @@ export class CustomizeView extends LitElement {
                             <option value="both">Both Speaker and Microphone</option>
                         </select>
                     </div>
-                    ${this.audioMode !== 'speaker_only' ? html`
-                        <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
-                    ` : ''}
+                    ${
+                        this.audioMode !== 'speaker_only'
+                            ? html`
+                                  <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
+                              `
+                            : ''
+                    }
                     <div class="form-group">
                         <label class="form-label">Image Quality</label>
                         <select class="control" .value=${this.selectedImageQuality} @change=${this.handleImageQualitySelect}>
                             <option value="high">High Quality</option>
                             <option value="medium">Medium Quality</option>
                             <option value="low">Low Quality</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">VAD Sensitivity (Local Audio Capture)</label>
+                        <select class="control" .value=${this.vadMode} @change=${this.handleVadModeChange}>
+                            <option value="VERY_AGGRESSIVE">Very Aggressive (recommended, filters background noise)</option>
+                            <option value="AGGRESSIVE">Aggressive (filters moderate noise)</option>
+                            <option value="NORMAL">Normal (standard quiet room)</option>
+                            <option value="LOW_BITRATE">Low Bitrate (captures quiet whispers, no filtering)</option>
                         </select>
                     </div>
                 </div>
@@ -653,6 +707,30 @@ export class CustomizeView extends LitElement {
                             @input=${this.handleFontSizeChange}
                         />
                     </div>
+                    <div class="form-group" style="display: flex; align-items: center; gap: 8px; margin-top: 10px; grid-column: span 2;">
+                        <input
+                            type="checkbox"
+                            id="smart-click-through"
+                            ?checked=${this.smartClickThrough}
+                            @change=${this.handleSmartClickThroughChange}
+                            style="width: auto; margin: 0; cursor: pointer;"
+                        />
+                        <label for="smart-click-through" style="margin: 0; cursor: pointer; font-size: 0.9em; user-select: none;">
+                            Enable Hover-to-Interact (may cause cursor click/drag lag in other apps on macOS)
+                        </label>
+                    </div>
+                    <div class="form-group" style="display: flex; align-items: center; gap: 8px; margin-top: 10px; grid-column: span 2;">
+                        <input
+                            type="checkbox"
+                            id="auto-copy-clipboard"
+                            ?checked=${this.autoCopyClipboard}
+                            @change=${this.handleAutoCopyClipboardChange}
+                            style="width: auto; margin: 0; cursor: pointer;"
+                        />
+                        <label for="auto-copy-clipboard" style="margin: 0; cursor: pointer; font-size: 0.9em; user-select: none;">
+                            Auto-copy new answers to clipboard
+                        </label>
+                    </div>
                 </div>
             </section>
         `;
@@ -662,20 +740,22 @@ export class CustomizeView extends LitElement {
         return html`
             <section class="surface">
                 <div class="surface-title">Keyboard Shortcuts</div>
-                ${this.getKeybindActions().map(action => html`
-                    <div class="keybind-row">
-                        <span class="keybind-name">${action.name}</span>
-                        <input
-                            type="text"
-                            class="control keybind-input"
-                            .value=${this.keybinds[action.key]}
-                            data-action=${action.key}
-                            @keydown=${this.handleKeybindInput}
-                            @focus=${this.handleKeybindFocus}
-                            readonly
-                        />
-                    </div>
-                `)}
+                ${this.getKeybindActions().map(
+                    action => html`
+                        <div class="keybind-row">
+                            <span class="keybind-name">${action.name}</span>
+                            <input
+                                type="text"
+                                class="control keybind-input"
+                                .value=${this.keybinds[action.key]}
+                                data-action=${action.key}
+                                @keydown=${this.handleKeybindInput}
+                                @focus=${this.handleKeybindFocus}
+                                readonly
+                            />
+                        </div>
+                    `
+                )}
                 <div style="margin-top: var(--space-sm);">
                     <button class="control" style="width:auto;padding:8px 10px;" @click=${this.resetKeybinds}>Reset to defaults</button>
                 </div>
@@ -695,9 +775,11 @@ export class CustomizeView extends LitElement {
                         ${this.isClearing ? 'Clearing...' : 'Delete all data'}
                     </button>
                 </div>
-                ${this.clearStatusMessage ? html`
-                    <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div>
-                ` : ''}
+                ${
+                    this.clearStatusMessage
+                        ? html` <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div> `
+                        : ''
+                }
             </section>
         `;
     }
@@ -707,10 +789,7 @@ export class CustomizeView extends LitElement {
             <div class="unified-page">
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
-                    ${this.renderAudioSection()}
-                    ${this.renderLanguageSection()}
-                    ${this.renderAppearanceSection()}
-                    ${this.renderKeyboardSection()}
+                    ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()} ${this.renderKeyboardSection()}
                     ${this.renderPrivacySection()}
                 </div>
             </div>

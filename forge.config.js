@@ -4,28 +4,39 @@ const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 module.exports = {
     packagerConfig: {
         asar: {
-            unpack: '**/{onnxruntime-node,onnxruntime-common,@huggingface/transformers,sharp,@img}/**',
+            // whisperWorker.js must be unpacked: worker_threads cannot load files from inside asar
+            unpack: '{**/{onnxruntime-node,onnxruntime-common,@huggingface/transformers,sharp,@img}/**,**/whisperWorker.js}',
         },
         extraResource: ['./src/assets/SystemAudioDump'],
         name: 'Cheating Daddy',
         icon: 'src/assets/logo',
-        // use `security find-identity -v -p codesigning` to find your identity
-        // for macos signing
-        // also fuck apple
-        // osxSign: {
-        //    identity: '<paste your identity here>',
-        //   optionsForFile: (filePath) => {
-        //       return {
-        //           entitlements: 'entitlements.plist',
-        //       };
-        //   },
-        // },
-        // notarize if off cuz i ran this for 6 hours and it still didnt finish
-        // osxNotarize: {
-        //    appleId: 'your apple id',
-        //    appleIdPassword: 'app specific password',
-        //    teamId: 'your team id',
-        // },
+        appBundleId: 'com.cheatingdaddy.app',
+        appCategoryType: 'public.app-category.productivity',
+        extendInfo: {
+            // Required: macOS kills a packaged app that accesses the mic without this
+            NSMicrophoneUsageDescription: 'Microphone access is used to transcribe your side of the conversation.',
+            NSAudioCaptureUsageDescription: 'System audio is captured to transcribe the conversation.',
+        },
+        // macOS signing: set APPLE_SIGNING_IDENTITY to enable
+        // (find yours with `security find-identity -v -p codesigning`)
+        ...(process.env.APPLE_SIGNING_IDENTITY
+            ? {
+                  osxSign: {
+                      identity: process.env.APPLE_SIGNING_IDENTITY,
+                      optionsForFile: () => ({ entitlements: 'entitlements.plist' }),
+                  },
+              }
+            : {}),
+        // Notarization: set all three env vars to enable
+        ...(process.env.APPLE_ID && process.env.APPLE_ID_PASSWORD && process.env.APPLE_TEAM_ID
+            ? {
+                  osxNotarize: {
+                      appleId: process.env.APPLE_ID,
+                      appleIdPassword: process.env.APPLE_ID_PASSWORD,
+                      teamId: process.env.APPLE_TEAM_ID,
+                  },
+              }
+            : {}),
     },
     rebuildConfig: {},
     makers: [

@@ -9,7 +9,8 @@
         "package": "electron-forge package",
         "make": "electron-forge make",
         "publish": "electron-forge publish",
-        "lint": "echo \"No linting configured\""
+        "lint": "echo \"No linting configured\"",
+        "test": "node --test \"test/*.test.js\""
     },
     "keywords": [
         "cheating daddy",
@@ -24,10 +25,12 @@
     },
     "license": "GPL-3.0",
     "dependencies": {
+        "@anthropic-ai/sdk": "^0.112.3",
         "@google/genai": "^1.2.0",
         "@huggingface/transformers": "^3.8.1",
         "electron-squirrel-startup": "^1.0.1",
         "ollama": "^0.6.3",
+        "tesseract.js": "^7.0.0",
         "ws": "^8.19.0"
     },
     "devDependencies": {

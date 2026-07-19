@@ -19,6 +19,9 @@ app.whenReady().then(async () => {
     // Initialize storage (checks version, resets if needed)
     storage.initializeStorage();
 
+    // Encrypt any plaintext API keys left on disk by older versions
+    storage.migrateCredentialsEncryption();
+
     // Trigger screen recording permission prompt on macOS if not already granted
     if (process.platform === 'darwin') {
         const { desktopCapturer } = require('electron');

@@ -37,12 +37,61 @@ A real-time AI assistant that provides contextual help during video calls, inter
 
 ## Configuration & Environment Variables
 
-The application supports loading configuration defaults via a `.env` file located in the project root. Copy `.env.example` to `.env` to customize:
+Copy `.env.example` to `.env` in the project root to pre-load API keys for local
+development:
 
-- **`ENABLED_PROVIDERS`**: Comma-separated list of visible providers (e.g. `groq,openai` to show only Groq and ChatGPT).
-- **`GROQ_API_KEY`**, **`OPENAI_API_KEY`**, etc.: Pre-load API keys so they are active automatically.
-- **`ACTIVE_ANSWER_PROVIDER`**: Pre-select the active provider on startup (e.g. `groq` or `openai`).
-- **`GROQ_MODEL`**, **`OPENAI_MODEL`**: Override default model selections.
+- **`GEMINI_API_KEY`**, **`GROQ_API_KEY`**, **`ANTHROPIC_API_KEY`**, **`OPENAI_API_KEY`**: loaded at startup and take priority over a key typed into the app UI.
+
+**`.env` is credentials-only, by design.** Which provider/model actually answers
+your questions is controlled entirely by the select fields in Settings, and is
+saved to `preferences.json`, not `.env`. Earlier versions let `.env` also set
+`ACTIVE_ANSWER_PROVIDER` / `ENABLED_PROVIDERS` / `GROQ_MODEL` / `OPENAI_MODEL` —
+that was removed because it silently overwrote your UI selection on every
+restart (pick OpenAI in Settings, quit and relaunch, and it would silently
+revert to whatever `.env` said). If you're editing this codebase, don't
+reintroduce env-var overrides for *behavior* — only for *credentials*.
+
+## Local AI Setup (Ollama / LM Studio)
+
+Local mode runs everything on your machine — no API keys, no per-request cost,
+fully offline. In Settings, choose **Local AI** and pick a backend:
+
+- **Ollama**: install from [ollama.com](https://ollama.com), then `ollama pull <model>` (e.g. `gemma3:4b`, `llama3.1`). Point the app at `http://127.0.0.1:11434` (default) — the model dropdown refreshes live from whatever you have pulled.
+- **LM Studio**: load a model in LM Studio, then **start its local server** (Developer tab → Start Server). The model in LM Studio's chat window being "loaded" is not enough — the *server* has to be running for this app to reach it, or you'll see "Cannot reach LM Studio (is the local server started?)". Default URL: `http://127.0.0.1:1234`.
+
+**Hybrid mode** (Answer Engine → "Groq / Claude API" while in Local AI mode):
+transcription still runs 100% on-device via Whisper, but answers are generated
+by your configured Groq/Claude/OpenAI key instead of the local model. Use this
+when local model generation feels too slow but you still want private,
+on-device transcription with no Gemini involved at all.
+
+## Ghost Mode (Click-through)
+
+Press `Cmd+M` / `Ctrl+M` to toggle the overlay between two states:
+
+- **Off (default)**: the window is a normal window — drag it by the top bar, click buttons, type in the input box.
+- **On**: every click and keystroke passes straight through to whatever is behind the overlay (Zoom, your notes, a browser). The overlay becomes read-only — use it to glance at an answer while typing somewhere else. Press the shortcut again to get interaction back.
+
+**Linux:** click-through relies on `setIgnoreMouseEvents(true, { forward: true })`,
+which is not reliably supported on Linux window managers. On Linux, ghost mode
+may leave the overlay fully click-through with no way to interact until you
+toggle it off again via the keyboard shortcut — there is currently no
+Linux-specific fallback. macOS and Windows are unaffected.
+
+## Troubleshooting
+
+**"Protobuf parsing failed" / Whisper worker crashes on Windows**: this means
+the local Whisper model file downloaded corrupted or incomplete — common on
+unstable or corporate-proxied connections, or when antivirus software
+interferes with the download mid-write. This is an environment issue, not a
+platform bug (the same code runs identically on macOS/Windows/Linux — it just
+depends on the download completing intact). The app auto-recovers: it clears
+the corrupted cache and, if you have a Groq key configured, automatically
+switches transcription to Groq's cloud Whisper (no local download involved at
+all) so the next session works without you doing anything. If you don't have a
+Groq key yet, get a free one at [console.groq.com/keys](https://console.groq.com/keys),
+or manually delete the `whisper-models` folder shown in the error log and
+retry on a more stable connection.
 
 ## Keyboard Shortcuts
 

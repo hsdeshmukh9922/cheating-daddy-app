@@ -2,6 +2,7 @@ const { GoogleGenAI, Modality } = require('@google/genai');
 const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio, STREAM_UI_INTERVAL_MS, MAX_ANSWER_HISTORY_MESSAGES } = require('../audioUtils');
+const { stripThinkingTags, streamChatCompletion } = require('./streamingClient');
 const { getSystemPrompt } = require('./prompts');
 const {
     getAvailableModel,
@@ -91,46 +92,78 @@ function dispatchTranscription() {
 
 // Route transcription to the configured active model provider, with fallback to others.
 // getPreferences() is a synchronous fs.readFileSync call — safe to call inline here.
-function dispatchToAnswerProvider(text) {
-    const prefs = getPreferences();
-    let activeProvider = prefs.activeAnswerProvider || 'groq';
+// Function declarations below are hoisted, so referencing them here (before their
+// textual definition) is safe - this map is only ever read once dispatch actually runs.
+const ANSWER_PROVIDER_SENDERS = { groq: sendToGroq, openai: sendToOpenAI, claude: sendToClaude, gemini: sendToGemma };
+const PROVIDER_KEY_CHECKS = { groq: hasGroqKey, openai: hasOpenaiKey, claude: hasAnthropicKey, gemini: () => !!getApiKey() };
+const PROVIDER_LABELS = { groq: 'Groq', openai: 'OpenAI', claude: 'Claude', gemini: 'Gemini' };
 
-    // Handle invalid values like 'groq,openai' gracefully
+function normalizeActiveProvider(prefs) {
+    let activeProvider = prefs.activeAnswerProvider || 'groq';
+    // Handle invalid saved values like 'groq,openai' gracefully
     if (activeProvider.includes(',')) {
         activeProvider = activeProvider.split(',')[0].trim();
     }
-    if (!['groq', 'openai', 'claude', 'gemini'].includes(activeProvider)) {
+    if (!PROVIDER_LABELS[activeProvider]) {
         activeProvider = 'groq';
     }
+    return activeProvider;
+}
 
-    if (activeProvider === 'claude') {
-        if (hasAnthropicKey()) {
-            sendToClaude(text);
-        } else {
-            sendToRenderer('new-response', '⚠️ Claude Error: No API key configured. Please enter your Anthropic API key in Settings.');
-            sendToRenderer('update-status', 'Claude error: missing API key');
+// Answers the current question, trying the active provider first and silently
+// falling back to other configured-and-enabled providers on failure - as long
+// as the failed attempt never showed the user any text (see `hadOutput` on each
+// sender's return value). All providers share `groqConversationHistory`, so a
+// failed attempt's history push is rolled back before the next one is tried,
+// preventing a duplicate user-message entry.
+async function dispatchToAnswerProvider(text) {
+    const prefs = getPreferences();
+    const activeProvider = normalizeActiveProvider(prefs);
+
+    const enabledRaw = prefs.enabledProviders || 'groq,openai';
+    const enabled = enabledRaw
+        .split(',')
+        .map(s => s.trim().toLowerCase())
+        .filter(s => PROVIDER_LABELS[s]);
+
+    // Active provider first, then other enabled providers that actually have a
+    // key configured (a provider with no key can't be retried, so skip it here
+    // rather than surfacing a confusing mid-chain "no key" error).
+    const candidates = [activeProvider, ...enabled.filter(p => p !== activeProvider)].filter(p => PROVIDER_KEY_CHECKS[p]());
+
+    if (candidates.length === 0) {
+        sendToRenderer(
+            'new-response',
+            `⚠️ ${PROVIDER_LABELS[activeProvider]} Error: No API key configured. Please enter your ${PROVIDER_LABELS[activeProvider]} API key in Settings.`
+        );
+        sendToRenderer('update-status', `${PROVIDER_LABELS[activeProvider]} error: missing API key`);
+        return;
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+        const provider = candidates[i];
+        const isLast = i === candidates.length - 1;
+        const historyLengthBeforeAttempt = groqConversationHistory.length;
+
+        const result = await ANSWER_PROVIDER_SENDERS[provider](text, { silent: !isLast });
+
+        if (!result || result.ok) return; // success, or a sender with no status contract (assume handled)
+
+        // Roll back this attempt's own history push (each sender pushes the user
+        // message before its network call) so the next attempt doesn't duplicate it.
+        if (groqConversationHistory.length > historyLengthBeforeAttempt) {
+            groqConversationHistory = groqConversationHistory.slice(0, historyLengthBeforeAttempt);
         }
-    } else if (activeProvider === 'openai') {
-        if (hasOpenaiKey()) {
-            sendToOpenAI(text);
-        } else {
-            sendToRenderer('new-response', '⚠️ OpenAI Error: No API key configured. Please enter your OpenAI API key in Settings.');
-            sendToRenderer('update-status', 'OpenAI error: missing API key');
+
+        if (isLast) return; // last candidate already rendered its own error (silent: false)
+
+        if (result.hadOutput) {
+            // Partial text already reached the UI - falling back now would show a
+            // second, unrelated answer stacked under a half-finished one. Stop here.
+            return;
         }
-    } else if (activeProvider === 'groq') {
-        if (hasGroqKey()) {
-            sendToGroq(text);
-        } else {
-            sendToRenderer('new-response', '⚠️ Groq Error: No API key configured. Please enter your Groq API key in Settings.');
-            sendToRenderer('update-status', 'Groq error: missing API key');
-        }
-    } else if (activeProvider === 'gemini') {
-        if (getApiKey()) {
-            sendToGemma(text);
-        } else {
-            sendToRenderer('new-response', '⚠️ Gemini Error: No API key configured. Please enter your Gemini API key in Settings.');
-            sendToRenderer('update-status', 'Gemini error: missing API key');
-        }
+
+        console.log(`[Dispatch] ${PROVIDER_LABELS[provider]} failed with no output shown, falling back to ${PROVIDER_LABELS[candidates[i + 1]]}...`);
     }
 }
 
@@ -322,16 +355,16 @@ function getAnthropicClient(apiKey) {
     return cachedAnthropicClient;
 }
 
-async function sendToClaude(transcription) {
+async function sendToClaude(transcription, { silent = false } = {}) {
     const apiKey = getAnthropicApiKey();
     if (!apiKey) {
         console.log('No Claude API key configured, skipping Claude response');
-        return;
+        return { ok: false, hadOutput: false };
     }
 
     if (!transcription || transcription.trim() === '') {
         console.log('Empty transcription, skipping Claude');
-        return;
+        return { ok: false, hadOutput: false };
     }
 
     console.log('Sending to Claude:', transcription.substring(0, 100) + '...');
@@ -345,6 +378,7 @@ async function sendToClaude(transcription) {
         groqConversationHistory = groqConversationHistory.slice(-MAX_ANSWER_HISTORY_MESSAGES);
     }
 
+    let isFirst = true;
     try {
         const client = getAnthropicClient(apiKey);
 
@@ -357,7 +391,6 @@ async function sendToClaude(transcription) {
         });
 
         let fullText = '';
-        let isFirst = true;
         let lastEmit = 0;
 
         stream.on('text', delta => {
@@ -388,14 +421,26 @@ async function sendToClaude(transcription) {
 
         console.log('Claude response completed');
         sendToRenderer('update-status', 'Listening...');
+        return { ok: true, hadOutput: true };
     } catch (error) {
-        console.error('Error calling Claude API:', error);
-        sendToRenderer('new-response', `⚠️ Claude Error: ${error.message}`);
-        sendToRenderer('update-status', 'Claude error: ' + error.message);
+        // isFirst still true means the stream never emitted a single token before
+        // failing - safe for the dispatcher to silently retry another provider.
+        const hadOutput = !isFirst;
+        if (!silent) {
+            console.error('Error calling Claude API:', error);
+            sendToRenderer('new-response', `⚠️ Claude Error: ${error.message}`);
+            sendToRenderer('update-status', 'Claude error: ' + error.message);
+        } else {
+            console.warn('[Claude] Silent failure (falling back to another provider):', error.message);
+        }
+        return { ok: false, hadOutput };
     }
 }
 
-function trimConversationHistoryForGemma(history, maxChars = 42000) {
+// 16000 chars (~4000 tokens) is a safety net, not the primary limit — history is
+// already capped at MAX_ANSWER_HISTORY_MESSAGES entries before this runs. Was
+// 42000 (~10500 tokens), sized for a cap that no longer exists at the call site.
+function trimConversationHistoryForGemma(history, maxChars = 16000) {
     if (!history || history.length === 0) return [];
     let totalChars = 0;
     const trimmed = [];
@@ -411,22 +456,29 @@ function trimConversationHistoryForGemma(history, maxChars = 42000) {
     return trimmed;
 }
 
-function stripThinkingTags(text) {
-    // Also strips a trailing unclosed <think> block so in-progress reasoning
-    // never flashes on screen while a response is streaming
-    return text.replace(/<think>[\s\S]*?(<\/think>|$)/g, '').trim();
+// Turns a raw HTTP-error body into a clean one-line message: try to pull
+// `error.message` from JSON, then strip URLs so nothing is accidentally clickable.
+function parseApiErrorText(errorText) {
+    let parsed = errorText;
+    try {
+        parsed = JSON.parse(errorText).error?.message || errorText;
+    } catch (e) {}
+    return parsed
+        .replace(/https?:\/\/\S+/g, '')
+        .replace(/\s+You can find your API key at\s*\.?$/i, '')
+        .trim();
 }
 
-async function sendToGroq(transcription) {
+async function sendToGroq(transcription, { silent = false } = {}) {
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
         console.log('No Groq API key configured, skipping Groq response');
-        return;
+        return { ok: false, hadOutput: false };
     }
 
     if (!transcription || transcription.trim() === '') {
         console.log('Empty transcription, skipping Groq');
-        return;
+        return { ok: false, hadOutput: false };
     }
 
     const prefs = getPreferences();
@@ -443,135 +495,74 @@ async function sendToGroq(transcription) {
         groqConversationHistory = groqConversationHistory.slice(-MAX_ANSWER_HISTORY_MESSAGES);
     }
 
-    const controller = new AbortController();
-    let stallTimer = null;
-    const resetStall = () => {
-        if (stallTimer) clearTimeout(stallTimer);
-        stallTimer = setTimeout(() => {
-            console.error('[Groq] Stream stalled for', GROQ_STALL_TIMEOUT_MS / 1000, 's, aborting');
-            controller.abort();
-        }, GROQ_STALL_TIMEOUT_MS);
-    };
+    const result = await streamChatCompletion({
+        url: 'https://api.groq.com/openai/v1/chat/completions',
+        headers: {
+            Authorization: `Bearer ${groqApiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: {
+            model: modelToUse,
+            messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
+            stream: true,
+            temperature: 0.7,
+            max_tokens: 1024,
+        },
+        stallTimeoutMs: GROQ_STALL_TIMEOUT_MS,
+        onEmit: (text, isFirst) => sendToRenderer(isFirst ? 'new-response' : 'update-response', text),
+    });
 
-    try {
-        resetStall();
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            signal: controller.signal,
-            headers: {
-                Authorization: `Bearer ${groqApiKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: modelToUse,
-                messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
-                stream: true,
-                temperature: 0.7,
-                max_tokens: 1024,
-            }),
+    if (!result.ok) {
+        if (!silent) {
+            if (result.status) {
+                console.error('Groq API error:', result.status, result.error);
+                sendToRenderer('new-response', `⚠️ Groq Error (${result.status}): ${parseApiErrorText(result.error)}`);
+                sendToRenderer('update-status', `Groq error: ${result.status}`);
+            } else {
+                console.error('Error calling Groq API:', result.error);
+                sendToRenderer('new-response', `⚠️ Groq Error: ${result.error}`);
+                sendToRenderer('update-status', 'Groq error: ' + result.error);
+            }
+        } else {
+            console.warn('[Groq] Silent failure (falling back to another provider):', result.status || result.error);
+        }
+        return { ok: false, hadOutput: result.hadOutput };
+    }
+
+    const cleanedResponse = result.text;
+    const modelKey = modelToUse.split('/').pop();
+
+    const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
+    const historyChars = groqConversationHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
+    const inputChars = systemPromptChars + historyChars;
+    const outputChars = cleanedResponse.length;
+
+    incrementCharUsage('groq', modelKey, inputChars + outputChars);
+
+    if (cleanedResponse) {
+        groqConversationHistory.push({
+            role: 'assistant',
+            content: cleanedResponse,
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            let parsedError = errorText;
-            try {
-                const parsed = JSON.parse(errorText);
-                parsedError = parsed.error?.message || errorText;
-            } catch (e) {}
-            // Clean up URLs to prevent accidental clicks
-            parsedError = parsedError.replace(/https?:\/\/\S+/g, '').replace(/\s+You can find your API key at\s*\.?$/i, '');
-            console.error('Groq API error:', response.status, errorText);
-            sendToRenderer('new-response', `⚠️ Groq Error (${response.status}): ${parsedError.trim()}`);
-            sendToRenderer('update-status', `Groq error: ${response.status}`);
-            return;
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        let isFirst = true;
-        let lastEmit = 0;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            resetStall();
-
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') continue;
-
-                    try {
-                        const json = JSON.parse(data);
-                        const token = json.choices?.[0]?.delta?.content || '';
-                        if (token) {
-                            fullText += token;
-                            const displayText = stripThinkingTags(fullText);
-                            const now = Date.now();
-                            if (displayText && (isFirst || now - lastEmit >= STREAM_UI_INTERVAL_MS)) {
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                                isFirst = false;
-                                lastEmit = now;
-                            }
-                        }
-                    } catch (parseError) {
-                        // Skip invalid JSON chunks
-                    }
-                }
-            }
-        }
-
-        const cleanedResponse = stripThinkingTags(fullText);
-
-        // Flush the final text - the throttle above may have skipped the last tokens
-        if (cleanedResponse) {
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', cleanedResponse);
-        }
-
-        const modelKey = modelToUse.split('/').pop();
-
-        const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
-        const historyChars = groqConversationHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
-        const inputChars = systemPromptChars + historyChars;
-        const outputChars = cleanedResponse.length;
-
-        incrementCharUsage('groq', modelKey, inputChars + outputChars);
-
-        if (cleanedResponse) {
-            groqConversationHistory.push({
-                role: 'assistant',
-                content: cleanedResponse,
-            });
-
-            saveConversationTurn(transcription, cleanedResponse);
-        }
-
-        console.log(`Groq response completed (${modelToUse})`);
-        sendToRenderer('update-status', 'Listening...');
-    } catch (error) {
-        console.error('Error calling Groq API:', error);
-        const message = error.name === 'AbortError' ? 'request stalled and was aborted' : error.message;
-        sendToRenderer('new-response', `⚠️ Groq Error: ${message}`);
-        sendToRenderer('update-status', 'Groq error: ' + message);
-    } finally {
-        if (stallTimer) clearTimeout(stallTimer);
+        saveConversationTurn(transcription, cleanedResponse);
     }
+
+    console.log(`Groq response completed (${modelToUse})`);
+    sendToRenderer('update-status', 'Listening...');
+    return { ok: true, hadOutput: true };
 }
 
-async function sendToOpenAI(transcription) {
+async function sendToOpenAI(transcription, { silent = false } = {}) {
     const openaiApiKey = getOpenaiApiKey();
     if (!openaiApiKey) {
         console.log('No OpenAI API key configured, skipping OpenAI response');
-        return;
+        return { ok: false, hadOutput: false };
     }
 
     if (!transcription || transcription.trim() === '') {
         console.log('Empty transcription, skipping OpenAI');
-        return;
+        return { ok: false, hadOutput: false };
     }
 
     const prefs = getPreferences();
@@ -588,122 +579,60 @@ async function sendToOpenAI(transcription) {
         groqConversationHistory = groqConversationHistory.slice(-MAX_ANSWER_HISTORY_MESSAGES);
     }
 
-    const controller = new AbortController();
-    let stallTimer = null;
-    const resetStall = () => {
-        if (stallTimer) clearTimeout(stallTimer);
-        stallTimer = setTimeout(() => {
-            console.error('[OpenAI] Stream stalled, aborting');
-            controller.abort();
-        }, 30000);
-    };
+    const result = await streamChatCompletion({
+        url: 'https://api.openai.com/v1/chat/completions',
+        headers: {
+            Authorization: `Bearer ${openaiApiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: {
+            model: modelToUse,
+            messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
+            stream: true,
+            temperature: 0.7,
+            max_tokens: 1536,
+        },
+        onEmit: (text, isFirst) => sendToRenderer(isFirst ? 'new-response' : 'update-response', text),
+    });
 
-    try {
-        resetStall();
-        const response = await fetch('https://api.openai.com/v1/chat/completions', {
-            method: 'POST',
-            signal: controller.signal,
-            headers: {
-                Authorization: `Bearer ${openaiApiKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: modelToUse,
-                messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
-                stream: true,
-                temperature: 0.7,
-                max_tokens: 1536,
-            }),
+    if (!result.ok) {
+        if (!silent) {
+            if (result.status) {
+                console.error('OpenAI API error:', result.status, result.error);
+                sendToRenderer('new-response', `⚠️ OpenAI Error (${result.status}): ${parseApiErrorText(result.error)}`);
+                sendToRenderer('update-status', `OpenAI error: ${result.status}`);
+            } else {
+                console.error('Error calling OpenAI API:', result.error);
+                sendToRenderer('new-response', `⚠️ OpenAI Error: ${result.error}`);
+                sendToRenderer('update-status', 'OpenAI error: ' + result.error);
+            }
+        } else {
+            console.warn('[OpenAI] Silent failure (falling back to another provider):', result.status || result.error);
+        }
+        return { ok: false, hadOutput: result.hadOutput };
+    }
+
+    const cleanedResponse = result.text;
+    const modelKey = modelToUse.split('/').pop();
+    const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
+    const historyChars = groqConversationHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
+    const inputChars = systemPromptChars + historyChars;
+    const outputChars = cleanedResponse.length;
+
+    incrementCharUsage('openai', modelKey, inputChars + outputChars);
+
+    if (cleanedResponse) {
+        groqConversationHistory.push({
+            role: 'assistant',
+            content: cleanedResponse,
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            let parsedError = errorText;
-            try {
-                const parsed = JSON.parse(errorText);
-                parsedError = parsed.error?.message || errorText;
-            } catch (e) {}
-            // Clean up URLs to prevent accidental clicks
-            parsedError = parsedError.replace(/https?:\/\/\S+/g, '').replace(/\s+You can find your API key at\s*\.?$/i, '');
-            console.error('OpenAI API error:', response.status, errorText);
-            sendToRenderer('new-response', `⚠️ OpenAI Error (${response.status}): ${parsedError.trim()}`);
-            sendToRenderer('update-status', `OpenAI error: ${response.status}`);
-            return;
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        let isFirst = true;
-        let lastEmit = 0;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            resetStall();
-
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') continue;
-
-                    try {
-                        const json = JSON.parse(data);
-                        const token = json.choices?.[0]?.delta?.content || '';
-                        if (token) {
-                            fullText += token;
-                            const displayText = stripThinkingTags(fullText);
-                            const now = Date.now();
-                            if (displayText && (isFirst || now - lastEmit >= STREAM_UI_INTERVAL_MS)) {
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                                isFirst = false;
-                                lastEmit = now;
-                            }
-                        }
-                    } catch (parseError) {
-                        // Skip invalid JSON chunks
-                    }
-                }
-            }
-        }
-
-        const cleanedResponse = stripThinkingTags(fullText);
-
-        // Flush the final text
-        if (cleanedResponse) {
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', cleanedResponse);
-        }
-
-        const modelKey = modelToUse.split('/').pop();
-        const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
-        const historyChars = groqConversationHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
-        const inputChars = systemPromptChars + historyChars;
-        const outputChars = cleanedResponse.length;
-
-        incrementCharUsage('openai', modelKey, inputChars + outputChars);
-
-        if (cleanedResponse) {
-            groqConversationHistory.push({
-                role: 'assistant',
-                content: cleanedResponse,
-            });
-
-            saveConversationTurn(transcription, cleanedResponse);
-        }
-
-        console.log(`OpenAI response completed (${modelToUse})`);
-        sendToRenderer('update-status', 'Listening...');
-    } catch (error) {
-        console.error('Error calling OpenAI API:', error);
-        const message = error.name === 'AbortError' ? 'request stalled and was aborted' : error.message;
-        sendToRenderer('new-response', `⚠️ OpenAI Error: ${message}`);
-        sendToRenderer('update-status', 'OpenAI error: ' + message);
-    } finally {
-        if (stallTimer) clearTimeout(stallTimer);
+        saveConversationTurn(transcription, cleanedResponse);
     }
+
+    console.log(`OpenAI response completed (${modelToUse})`);
+    sendToRenderer('update-status', 'Listening...');
+    return { ok: true, hadOutput: true };
 }
 
 async function sendToGemma(transcription) {
@@ -725,7 +654,7 @@ async function sendToGemma(transcription) {
         content: transcription.trim(),
     });
 
-    const trimmedHistory = trimConversationHistoryForGemma(groqConversationHistory, 42000);
+    const trimmedHistory = trimConversationHistoryForGemma(groqConversationHistory);
 
     try {
         const ai = getHttpClient(apiKey);

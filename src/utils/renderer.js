@@ -610,10 +610,17 @@ function setupWindowsLoopbackProcessing() {
     audioProcessor.connect(audioContext.destination);
 }
 
-const MANUAL_SCREENSHOT_PROMPT = `Help me on this page, give me the answer no bs, complete answer.
-So if its a code question, give me the approach in few bullet points, then the entire code. Also if theres anything else i need to know, tell me.
-If its a question about the website, give me the answer no bs, complete answer.
-If its a mcq question, give me the answer no bs, complete answer.`;
+// Mirrors the question-type routing in src/utils/prompts.js (interview profile) so
+// a screenshotted question gets the same density/format as a spoken one.
+const MANUAL_SCREENSHOT_PROMPT = `Look at what's on screen and answer directly — no "I see that...", no restating the question, just the answer.
+
+Classify what's shown and answer in that format:
+- **Coding / DSA problem**: 2-4 bullets on the approach, then a one-line time/space complexity bullet, then one clean commented code block. No prose after the code unless a tricky edge case needs one line.
+- **MCQ / multiple choice**: state the correct option first (bolded), then 1-2 sentences of why.
+- **General/website question**: direct, complete answer — bullets over paragraphs.
+- **Error message / debugging**: what's wrong in one sentence, then the fix as a code block or bulleted steps.
+
+If anything else on screen is relevant to the answer (a hint, a constraint, related context), mention it briefly. No filler, no meta-commentary — output only the answer.`;
 
 async function captureManualScreenshot(imageQuality = null) {
     console.log('Manual screenshot triggered');

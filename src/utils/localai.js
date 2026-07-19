@@ -1,8 +1,9 @@
 const { Ollama } = require('ollama');
 const { getSystemPrompt } = require('./prompts');
 const { getGroqApiKey } = require('../storage');
-const { sendToRenderer, initializeNewSession, saveConversationTurn, stripThinkingTags, dispatchToAnswerProvider } = require('./gemini');
+const { sendToRenderer, initializeNewSession, saveConversationTurn, dispatchToAnswerProvider } = require('./gemini');
 const { pcmToWavBuffer, STREAM_UI_INTERVAL_MS, MAX_ANSWER_HISTORY_MESSAGES } = require('../audioUtils');
+const { stripThinkingTags, streamChatCompletion } = require('./streamingClient');
 
 // ── State ──
 
@@ -282,6 +283,45 @@ function teardownWhisperWorker() {
     }
 }
 
+// Runs after a Whisper worker failure (load-error / worker error / bad exit code).
+// Clears the on-disk model cache in case the failure was a corrupted/incomplete
+// download (e.g. "Protobuf parsing failed" - a truncated .onnx file, common on
+// flaky or proxied networks), then repoints future sessions somewhere that will
+// actually work instead of just retrying the same broken local download:
+//   - Groq key present -> switch to Groq's cloud Whisper (no download, no native
+//     ONNX runtime involved at all - sidesteps this whole class of failure)
+//   - no Groq key -> fall back to the smallest local model, the least likely to
+//     hit a partial-download failure again
+// Without this, a corrupted download on an unstable connection becomes a crash
+// loop: every retry re-downloads the same model over the same bad connection.
+function recoverFromWhisperFailure(context) {
+    teardownWhisperWorker();
+
+    const fs = require('fs');
+    const path = require('path');
+    if (whisperCacheDir && whisperModelName) {
+        const modelCachePath = path.join(whisperCacheDir, whisperModelName);
+        if (fs.existsSync(modelCachePath)) {
+            try {
+                fs.rmSync(modelCachePath, { recursive: true, force: true });
+                console.log(`[LocalAI] Cleared corrupted model cache (${context}) at: ${modelCachePath}`);
+            } catch (rmError) {
+                console.error(`[LocalAI] Failed to clear corrupted cache (${context}):`, rmError);
+            }
+        }
+    }
+
+    try {
+        const storage = require('../storage');
+        const fallbackModel = getGroqApiKey() && getGroqApiKey().trim() ? 'groq-api' : 'Xenova/whisper-small';
+        storage.updatePreference('localByokWhisperModel', fallbackModel);
+        storage.updatePreference('whisperModel', fallbackModel);
+        console.log(`[LocalAI] Reset whisperModel preference to ${fallbackModel} (${context})`);
+    } catch (prefError) {
+        console.error(`[LocalAI] Failed to reset whisperModel preference (${context}):`, prefError);
+    }
+}
+
 function loadWhisperPipeline(modelName) {
     if (whisperWorkerReady && whisperModelName === modelName) return Promise.resolve(true);
     if (isWhisperLoading) return Promise.resolve(null);
@@ -318,34 +358,7 @@ function loadWhisperPipeline(modelName) {
                     isWhisperLoading = false;
                     sendToRenderer('whisper-downloading', false);
                     sendToRenderer('update-status', 'Failed to load Whisper model: ' + msg.error);
-
-                    teardownWhisperWorker();
-
-                    // Auto-recovery: delete the corrupted model cache after worker is terminated
-                    const fs = require('fs');
-                    const path = require('path');
-                    if (whisperCacheDir && whisperModelName) {
-                        const modelCachePath = path.join(whisperCacheDir, whisperModelName);
-                        if (fs.existsSync(modelCachePath)) {
-                            try {
-                                fs.rmSync(modelCachePath, { recursive: true, force: true });
-                                console.log(`[LocalAI] Cleared corrupted model cache at: ${modelCachePath}`);
-                            } catch (rmError) {
-                                console.error('[LocalAI] Failed to clear corrupted cache:', rmError);
-                            }
-                        }
-                    }
-
-                    // Reset preferences to default 'Xenova/whisper-small' to prevent crash loops
-                    try {
-                        const storage = require('../storage');
-                        storage.updatePreference('localByokWhisperModel', 'Xenova/whisper-small');
-                        storage.updatePreference('whisperModel', 'Xenova/whisper-small');
-                        console.log('[LocalAI] Reset whisperModel preference to Xenova/whisper-small');
-                    } catch (prefError) {
-                        console.error('[LocalAI] Failed to reset whisperModel preference:', prefError);
-                    }
-
+                    recoverFromWhisperFailure('load-error');
                     resolve(null);
                 } else {
                     handleWorkerResult(msg);
@@ -357,68 +370,20 @@ function loadWhisperPipeline(modelName) {
                 isWhisperLoading = false;
                 sendToRenderer('whisper-downloading', false);
                 sendToRenderer('update-status', 'Whisper worker error: ' + err.message);
-
-                teardownWhisperWorker();
-
-                // Auto-recovery: delete the corrupted model cache after worker is terminated
-                const fs = require('fs');
-                const path = require('path');
-                if (whisperCacheDir && whisperModelName) {
-                    const modelCachePath = path.join(whisperCacheDir, whisperModelName);
-                    if (fs.existsSync(modelCachePath)) {
-                        try {
-                            fs.rmSync(modelCachePath, { recursive: true, force: true });
-                            console.log(`[LocalAI] Cleared corrupted model cache at: ${modelCachePath}`);
-                        } catch (rmError) {
-                            console.error('[LocalAI] Failed to clear corrupted cache:', rmError);
-                        }
-                    }
-                }
-
-                // Reset preferences to default 'Xenova/whisper-small' to prevent crash loops
-                try {
-                    const storage = require('../storage');
-                    storage.updatePreference('localByokWhisperModel', 'Xenova/whisper-small');
-                    storage.updatePreference('whisperModel', 'Xenova/whisper-small');
-                    console.log('[LocalAI] Reset whisperModel preference to Xenova/whisper-small');
-                } catch (prefError) {
-                    console.error('[LocalAI] Failed to reset whisperModel preference:', prefError);
-                }
-
+                recoverFromWhisperFailure('worker error');
                 resolve(null);
             });
 
             whisperWorker.on('exit', code => {
                 if (code !== 0) {
                     console.error('[LocalAI] Whisper worker exited with code', code);
-
-                    teardownWhisperWorker();
-
-                    // Auto-recovery: delete the corrupted model cache after worker is terminated
-                    const fs = require('fs');
-                    const path = require('path');
-                    if (whisperCacheDir && whisperModelName) {
-                        const modelCachePath = path.join(whisperCacheDir, whisperModelName);
-                        if (fs.existsSync(modelCachePath)) {
-                            try {
-                                fs.rmSync(modelCachePath, { recursive: true, force: true });
-                                console.log(`[LocalAI] Cleared corrupted model cache on exit at: ${modelCachePath}`);
-                            } catch (rmError) {
-                                console.error('[LocalAI] Failed to clear corrupted cache on exit:', rmError);
-                            }
-                        }
-                    }
-
-                    // Reset preferences to default 'Xenova/whisper-small' to prevent crash loops
-                    try {
-                        const storage = require('../storage');
-                        storage.updatePreference('localByokWhisperModel', 'Xenova/whisper-small');
-                        storage.updatePreference('whisperModel', 'Xenova/whisper-small');
-                        console.log('[LocalAI] Reset whisperModel preference to Xenova/whisper-small');
-                    } catch (prefError) {
-                        console.error('[LocalAI] Failed to reset whisperModel preference:', prefError);
-                    }
-
+                    isWhisperLoading = false;
+                    sendToRenderer('whisper-downloading', false);
+                    sendToRenderer(
+                        'update-status',
+                        'Whisper worker crashed (exit code ' + code + ') - this is usually a corrupted model download'
+                    );
+                    recoverFromWhisperFailure('exit code ' + code);
                     resolve(null);
                 } else {
                     teardownWhisperWorker();
@@ -548,91 +513,35 @@ async function sendToLmStudio(transcription) {
         localConversationHistory = localConversationHistory.slice(-MAX_ANSWER_HISTORY_MESSAGES);
     }
 
-    const controller = new AbortController();
-    const watchdog = createStallWatchdog(() => controller.abort());
+    const result = await streamChatCompletion({
+        url: `${localServerHost}/v1/chat/completions`,
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+            model: ollamaModel,
+            messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...localConversationHistory],
+            stream: true,
+        },
+        onEmit: (text, isFirst) => sendToRenderer(isFirst ? 'new-response' : 'update-response', text),
+    });
 
-    try {
-        watchdog.reset();
-        const response = await fetch(`${localServerHost}/v1/chat/completions`, {
-            method: 'POST',
-            signal: controller.signal,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model: ollamaModel,
-                messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...localConversationHistory],
-                stream: true,
-            }),
+    if (!result.ok) {
+        console.error('[LocalAI] LM Studio error:', result.status || '', result.error);
+        sendToRenderer('update-status', result.status ? `LM Studio error: ${result.status}` : 'LM Studio error: ' + result.error);
+        return;
+    }
+
+    const cleanedResponse = result.text;
+    if (cleanedResponse) {
+        localConversationHistory.push({
+            role: 'assistant',
+            content: cleanedResponse,
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('[LocalAI] LM Studio error:', response.status, errorText);
-            sendToRenderer('update-status', `LM Studio error: ${response.status}`);
-            return;
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        let isFirst = true;
-        let lastEmit = 0;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            watchdog.reset();
-
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') continue;
-
-                    try {
-                        const json = JSON.parse(data);
-                        const token = json.choices?.[0]?.delta?.content || '';
-                        if (token) {
-                            fullText += token;
-                            const displayText = stripThinkingTags(fullText);
-                            const now = Date.now();
-                            if (displayText && (isFirst || now - lastEmit >= STREAM_UI_INTERVAL_MS)) {
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                                isFirst = false;
-                                lastEmit = now;
-                            }
-                        }
-                    } catch (parseError) {
-                        // Skip invalid JSON chunks
-                    }
-                }
-            }
-        }
-
-        const cleanedResponse = stripThinkingTags(fullText);
-
-        // Flush the final text - the throttle above may have skipped the last tokens
-        if (cleanedResponse) {
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', cleanedResponse);
-
-            localConversationHistory.push({
-                role: 'assistant',
-                content: cleanedResponse,
-            });
-
-            saveConversationTurn(transcription, cleanedResponse);
-        }
-
-        console.log('[LocalAI] LM Studio response completed');
-        sendToRenderer('update-status', 'Listening...');
-    } catch (error) {
-        console.error('[LocalAI] LM Studio error:', error);
-        const message = error.name === 'AbortError' ? 'request stalled and was aborted' : error.message;
-        sendToRenderer('update-status', 'LM Studio error: ' + message);
-    } finally {
-        watchdog.clear();
+        saveConversationTurn(transcription, cleanedResponse);
     }
+
+    console.log('[LocalAI] LM Studio response completed');
+    sendToRenderer('update-status', 'Listening...');
 }
 
 // Screenshot answers via LM Studio (OpenAI vision format; requires a vision-capable model)

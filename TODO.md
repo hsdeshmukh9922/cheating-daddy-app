@@ -15,6 +15,7 @@ Mark items with [x] when done. Items marked (USER) need Yashwant; the rest Claud
 - [x] Claude added as an answer provider (Home page key field; priority Claude > Groq > Gemma); local mode now supports LM Studio alongside Ollama with a fetched model dropdown + manual entry (MainView, localai.js, gemini.js, renderer.js, storage.js)
 
 - [x] Hybrid mode: local Whisper transcription + cloud answers (Groq/Claude) with zero Gemini usage — "Answer Engine" selector in local mode; screenshot 404 fixed (gemini-3.1-flash)
+- [x] Next-phase batch: question-type prompts extended to all profiles, streaming code deduplicated, cross-provider auto-fallback, Windows Whisper crash-loop fixed (falls back to Groq cloud Whisper instead of retrying a broken local download), README overhaul. See [NEXT_PHASE_TODO.md](NEXT_PHASE_TODO.md) for full detail.
 
 ## In progress / up next
 
@@ -29,6 +30,8 @@ Mark items with [x] when done. Items marked (USER) need Yashwant; the rest Claud
 - [ ] 9. Docs: README/help text for click-through behavior, local Gemma setup, key setup
 
 ## Post-launch
+
+See [NEXT_PHASE_TODO.md](NEXT_PHASE_TODO.md) for the full backlog (answer-quality, reliability, security/platform, docs, testing). Highlights:
 
 - [ ] Enable contextIsolation + preload bridge (window.js TODO) — invasive, touches every renderer require; do right after launch, not before
 - [ ] Auto-update story (electron-forge publisher / update server)
